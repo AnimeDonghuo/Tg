@@ -3,6 +3,7 @@ import logging
 import tempfile
 import requests
 import asyncio
+import random
 from fastapi import FastAPI
 from pyrogram import Client, filters, idle
 from pyrogram.types import Message
@@ -10,7 +11,6 @@ from pyrogram.errors import RPCError, FloodWait
 from dotenv import load_dotenv
 from threading import Thread
 import uvicorn
-import random
 
 # Load environment variables
 load_dotenv()
@@ -87,7 +87,7 @@ class DailymotionUploader:
                 "Content-Type": "application/x-www-form-urlencoded"
             }
             params = {
-                "title": title[:255],  # Truncate to max allowed length
+                "title": title[:255],
                 "published": "true",
                 "channel": "videogames"
             }
@@ -112,7 +112,7 @@ class DailymotionUploader:
                 upload_response = requests.put(
                     upload_url,
                     data=video_file,
-                    timeout=300  # 5 minutes for large files
+                    timeout=300
                 )
                 upload_response.raise_for_status()
                 
@@ -123,93 +123,104 @@ class DailymotionUploader:
 
 dm_uploader = DailymotionUploader()
 
-async def send_message_with_retry(chat_id, text):
+async def safe_send_message(chat_id, text, reply_to_message_id=None):
     max_retries = 3
     for attempt in range(max_retries):
         try:
-            # Generate a unique random_id for each attempt
-            random_id = random.randint(0, 2**64)
             return await telegram_client.send_message(
                 chat_id=chat_id,
                 text=text,
+                reply_to_message_id=reply_to_message_id,
                 disable_web_page_preview=True,
-                random_id=random_id
+                disable_notification=True
             )
         except FloodWait as e:
-            wait_time = e.value + 5
+            wait_time = e.value + 2
             logger.warning(f"Flood wait for {wait_time} seconds")
             await asyncio.sleep(wait_time)
         except RPCError as e:
-            logger.error(f"Telegram error (attempt {attempt + 1}): {e}")
+            logger.error(f"Message send error (attempt {attempt + 1}): {e}")
             if attempt == max_retries - 1:
                 raise
-            await asyncio.sleep(2 ** attempt)
+            await asyncio.sleep(1)
     return None
 
 @telegram_client.on_message(filters.video | filters.document)
 async def handle_media(client: Client, message: Message):
     temp_path = None
     try:
-        # Check file type
-        if message.document and not message.document.mime_type.startswith("video/"):
-            await send_message_with_retry(
+        # Check if the file is a video
+        if (message.document and 
+            not message.document.mime_type.startswith("video/") and
+            not message.document.file_name.endswith(('.mp4', '.mkv', '.avi', '.mov'))):
+            await safe_send_message(
                 message.chat.id,
-                "❌ Please send a video file (MP4, MKV, etc.)"
+                "❌ Please send a video file (MP4, MKV, AVI, MOV)",
+                reply_to_message_id=message.id
             )
             return
 
         # Start download
-        status_msg = await send_message_with_retry(
+        status_msg = await safe_send_message(
             message.chat.id,
-            "📥 Downloading your video..."
+            "📥 Downloading your video...",
+            reply_to_message_id=message.id
         )
+
+        if not status_msg:
+            logger.error("Failed to send status message")
+            return
 
         # Create temp file
         with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as temp_file:
             temp_path = temp_file.name
 
-        # Download file with progress
-        await client.download_media(
-            message,
-            file_name=temp_path,
-            progress=lambda current, total: logger.info(f"Downloaded {current}/{total} bytes")
-        )
-        
+        # Download file
+        try:
+            await client.download_media(
+                message,
+                file_name=temp_path,
+                progress=lambda current, total: logger.info(f"Download progress: {current}/{total}")
+            )
+        except Exception as e:
+            logger.error(f"Download failed: {e}")
+            await safe_send_message(
+                message.chat.id,
+                "❌ Failed to download video",
+                reply_to_message_id=message.id
+            )
+            return
+
         file_size = os.path.getsize(temp_path) / (1024 * 1024)
         logger.info(f"Downloaded file: {temp_path} ({file_size:.2f} MB)")
 
         # Start upload
-        await status_msg.edit_text("📤 Uploading to Dailymotion (this may take several minutes for large files)...")
+        await status_msg.edit_text("📤 Uploading to Dailymotion...")
         
         # Upload to Dailymotion
-        video_url = await dm_uploader.upload_video(
-            temp_path,
-            message.caption or f"Uploaded by {message.from_user.first_name}"
-        )
+        video_title = message.caption or f"{message.document.file_name}" if message.document else "Uploaded from Telegram"
+        video_url = await dm_uploader.upload_video(temp_path, video_title)
         
         if video_url:
             await status_msg.edit_text(
                 f"✅ Upload Successful!\n\n"
+                f"📹 Title: {video_title}\n"
                 f"🔗 [View on Dailymotion]({video_url})\n\n"
-                f"⏳ Video may take a few minutes to process."
+                f"⏳ Video is processing..."
             )
         else:
-            await send_message_with_retry(
+            await safe_send_message(
                 message.chat.id,
-                "❌ Failed to upload video. Please try again later."
+                "❌ Failed to upload video to Dailymotion",
+                reply_to_message_id=message.id
             )
 
-    except RPCError as e:
-        logger.error(f"Telegram error: {e}", exc_info=True)
-        await send_message_with_retry(
-            message.chat.id,
-            f"❌ Telegram error: {str(e)}"
-        )
     except Exception as e:
         logger.error(f"Error: {e}", exc_info=True)
-        await send_message_with_retry(
+        await safe_send_message(
             message.chat.id,
-            f"❌ Error: {str(e)}"
+            f"❌ Error: {str(e)}",
+            reply_to_message_id=message.id
         )
     finally:
         if temp_path and os.path.exists(temp_path):
@@ -220,12 +231,12 @@ async def handle_media(client: Client, message: Message):
 
 @telegram_client.on_message(filters.command("start"))
 async def start(client: Client, message: Message):
-    await send_message_with_retry(
+    await safe_send_message(
         message.chat.id,
         """
 🤖 **Dailymotion Video Uploader Bot**
 
-🔹 Send me any video file (MP4, MKV, AVI, MOV, etc.)
+🔹 Send me any video file (MP4, MKV, AVI, MOV)
 🔹 I'll upload it to Dailymotion automatically
 🔹 Supports large files (up to 2GB)
 
@@ -234,8 +245,8 @@ async def start(client: Client, message: Message):
 ⚠️ Note: 
 - Videos may take time to process on Dailymotion
 - Maximum file size: 2GB
-- Supported formats: MP4, MKV, AVI, MOV, etc.
-"""
+""",
+        reply_to_message_id=message.id
     )
 
 async def run_bot():
