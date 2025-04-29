@@ -21,9 +21,16 @@ services:
         secret: true
     regions:
       - fra
+    scalings:
+      min: 1
+      max: 1
     docker:
       build:
         dockerfile: Dockerfile
     http_health_check:
       path: /
       port: 8080
+      interval: 10
+      timeout: 5
+      unhealthy_threshold: 3
+      healthy_threshold: 2
