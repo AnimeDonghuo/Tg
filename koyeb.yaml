@@ -24,3 +24,6 @@ services:
     docker:
       build:
         dockerfile: Dockerfile
+    http_health_check:
+      path: /
+      port: 8080
